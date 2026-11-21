@@ -70,9 +70,9 @@ server copies its threading model, not its protocol.
 
 Three kinds of work, three places:
 
-1. **Server thread.** Parses requests and runs handlers. Handlers that only read thread-safe
-   state run here directly: status, log tail, log filter, and the guest memory reads
-   (`read_memory`, `search_memory`; see "Guest and GPU memory" for why that is safe). Handlers run one at a time, so a slow
+1. **Server thread.** Parses requests and runs handlers. Handlers that only touch thread-safe
+   state run here directly: status, log tail, log filter, and the guest memory tools
+   (`read_memory`, `write_memory`, `search_memory`; see "Guest and GPU memory" for why that is safe). Handlers run one at a time, so a slow
    request (a capture can take seconds) delays the next one. One agent at a time is the expected
    use.
 2. **Rasterizer thread.** Everything that touches the texture cache, pipeline cache, scheduler or
@@ -117,8 +117,8 @@ server is on but idle, its thread sleeps in `epoll`/IOCP.
   reads can expose game code, shaders, textures, buffers and personal information. Do not publish
   them or add them to the repository. Ask a maintainer for handling instructions before sharing
   the minimum necessary material, and share only what you have permission to disclose.
-  The memory tools read only the application's guest virtual memory and GPU virtual memory,
-  through their page tables, and never write either. They cannot reach host memory, the key area
+  The memory tools reach only the application's guest virtual memory and GPU virtual memory,
+  through their page tables, and only `write_memory` writes, to guest memory. They cannot reach host memory, the key area
   or the file system: an address resolves only through a page the guest has mapped. The adapter's `capture_image` reads only PNGs inside
   capture directories that it created in this session, and checks for path escapes.
 - **Logs.** `log_tail` returns lines that already go to `eden_log.txt`.
@@ -143,7 +143,7 @@ server is on but idle, its thread sleeps in `epoll`/IOCP.
 | `input`, `input_sequence` (buttons, sticks, frame-timed sequences) | Owner plays to the spot | Agent walks to the spot itself and replays a repro (done) | 2 |
 | `shaders` (inventory) | Shader dump and offline sweep | List loaded programs: key, hash, stage, address, lowered or rejected with the error | 2 |
 | `switches` (live `EDEN_NX2_*`) | Relaunch per switch | Toggle the observer switches live (classification below) | 2 |
-| `read_memory`, `search_memory`, `read_gpu_memory` | GDB stub session or log prints plus a rebuild | Read a range by address, find known values in the heap (done) | 3 |
+| `read_memory`, `write_memory`, `search_memory`, `read_gpu_memory` | GDB stub session or log prints plus a rebuild | Read or write a range by address, find known values in the heap (done) | 3 |
 | `dump_texture`, `dump_buffer` | Frame dump of the whole frame | One resource by GPU address, as PNG plus raw | 3 |
 | `gpu_timings` | `EDEN_NX2_GPU_PROFILE` relaunch, zones only | Per-pass GPU time of one frame | 3 |
 | Capture options (pass range, shader filter) | Not possible | Smaller captures, for example only passes 40 to 60 | 3 |
@@ -268,13 +268,25 @@ environment plus a relaunch plus a replay.
 
 ### Guest and GPU memory (implemented)
 
-All three are read only. Reads return at most 64 KiB. Addresses are hex strings (`"0x8012345000"`)
-or JSON numbers, and results give them back as hex strings.
+All but `write_memory` are read only. Reads return at most 64 KiB. Addresses are hex strings
+(`"0x8012345000"`) or JSON numbers, and results give them back as hex strings.
 
 **`read_memory`** `{address, size, as?}` reads the application process's guest virtual memory.
 `as` is `hex` (default, one string), `u32`, `u64` (hex strings, since JSON numbers lose bits
 past 2^53) or `f32` (`"nan"`, `"inf"` and `"-inf"` for non-finite values). If any page of the
 range is unmapped, the call fails and names the first unmapped address.
+
+**`write_memory`** `{address, data, as?}` writes the application process's guest virtual memory.
+`data` takes what `read_memory` returns for the same `as`, so a read's result can be sent back as
+a write: a hex string for `hex` (default), and an array of numbers for `u32`, of hex strings (or
+numbers) for `u64`, and of numbers, `"nan"`, `"inf"` or `"-inf"` for `f32`. A value that does not
+fit its format is refused. `"nan"` writes the quiet NaN `0x7fc00000`; any other NaN reads as
+`"nan"` as well, so write it back as `hex` or `u32`. If any page of the range is unmapped, the call
+fails, names the first unmapped address and writes nothing. Guest permissions are not checked, as
+with the GDB stub: code and read-only data are written too, and a dynarmic core drops the code it
+translated from the range. Under native execution on an ARM host a code write may not take effect
+(see "Guest and GPU memory"). A write has no size limit of its own: the 1 MiB request line bounds
+it, at about 512 KiB of data as `hex`. It returns `address` and `size`.
 
 **`search_memory`** `{pattern, start?, end?, max_hits?, regions?, budget_ms?}` finds a byte
 pattern (hex pairs in memory order, so little endian: `1.0f` is `0000803f`; up to 256 bytes) in
@@ -311,6 +323,29 @@ How the reads are safe:
   `GetPointerSilent` masks the top 16 bits, so addresses at or above 2^48 count as unmapped
   instead of aliasing low memory. The service stops before the process is destroyed, so the
   page table outlives every read.
+- **Guest memory writes, on the server thread.** The read's reasons do not carry over:
+  `WriteGuestMemory` writes through `Memory::WriteBlock` (`src/core/memory.cpp:1437`), which
+  commits the sparse table and tells the GPU caches about a write to a page they track. It then
+  calls `Core::InvalidateInstructionCacheRange`, so a dynarmic core drops the code it translated
+  from the range. That is what the GDB stub does for its `M` packet
+  (`src/core/debugger/gdbstub.cpp:269`). Both calls already run from threads that are not guest
+  cores while the game runs: HLE services write their replies with `WriteBlock` from their own
+  threads (`src/core/hle/service/hle_ipc.cpp:315`), and the cheat engine writes and invalidates
+  from the `HostTiming` thread (`src/core/memory/cheat_engine.cpp:86`). The GPU side,
+  `RasterizerVulkan::OnCPUWrite` (`src/video_core/renderer_vulkan/vk_rasterizer.cpp:3139`), takes
+  the buffer and texture cache locks and defers its page changes off the scheduler's thread. A
+  dynarmic core drops the code before it runs again, because the invalidation halts it. Native
+  execution on an ARM host runs only a barrier there (`src/core/arm/nce/arm_nce.cpp:536`), so a
+  code write may not take effect on such a host. A write therefore needs no state a read does not
+  need: it works while the game runs and while it is paused. `WriteBlock` alone writes the mapped
+  pages of a range that is partly unmapped, so every page is looked up first, as a read looks it
+  up. The lookup and the write are not one step. If the game unmaps a page between them, the write
+  skips that page, and the call fails and says the rest was written. A page unmapped while its own
+  bytes are being copied is not caught.
+- **What a guest write can do.** Guest threads keep running, so the game can read a value half
+  written, or write over it at once: a value it writes every frame comes back at its next write.
+  On pages the GPU caches track, the GPU uses the new bytes from its next upload, as after a write
+  by the game.
 - **What a guest read can show.** Guest threads keep running, so a value can change, or tear,
   while it is copied. Read it twice when that matters. On pages the GPU caches track
   (`RasterizerCachedMemory`), the read returns the CPU copy: GPU writes that are not written back
@@ -398,7 +433,8 @@ Live switch classification, from the switches in `src/`:
 
 ### Phase 3: memory, resources and timing (about 1 to 1.5 weeks)
 
-- **read_memory**, **search_memory** and **read_gpu_memory** are done; see "Guest and GPU memory".
+- **read_memory**, **write_memory**, **search_memory** and **read_gpu_memory** are done; see "Guest
+  and GPU memory".
 - **dump_texture** `{gpu_address}` and **dump_buffer** `{gpu_address, size}`. Look the address
   up in the texture cache on the rasterizer thread and reuse `FrameDump::Record`'s readback,
   decode and PNG path for one image.

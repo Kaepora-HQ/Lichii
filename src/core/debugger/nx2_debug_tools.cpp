@@ -13,6 +13,7 @@
 #include <fstream>
 #include <future>
 #include <iterator>
+#include <limits>
 #include <numeric>
 #include <thread>
 
@@ -23,6 +24,7 @@
 #include "common/scm_rev.h"
 #include "common/settings.h"
 #include "common/stb.h"
+#include "core/arm/debug.h"
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "core/debugger/nx2_bug_bundle.h"
@@ -110,9 +112,7 @@ std::string HexAddress(u64 value) {
     return fmt::format("{:#x}", value);
 }
 
-/// An address as a JSON number or a hex string (0x optional).
-u64 AddressParam(const json& params, const char* name) {
-    const json& value = params.at(name);
+u64 HexNumber(const json& value, std::string_view name) {
     if (value.is_number_unsigned()) {
         return value.get<u64>();
     }
@@ -130,6 +130,41 @@ u64 AddressParam(const json& params, const char* name) {
         throw std::runtime_error{fmt::format("bad {} \"{}\": want hex, e.g. 0x8012345000", name, text)};
     }
     return address;
+}
+
+u64 AddressParam(const json& params, const char* name) {
+    return HexNumber(params.at(name), name);
+}
+
+size_t ElementSize(std::string_view as) {
+    if (as == "hex") {
+        return 1;
+    }
+    if (as == "u32" || as == "f32") {
+        return 4;
+    }
+    if (as == "u64") {
+        return 8;
+    }
+    throw std::runtime_error{fmt::format("as \"{}\": want hex, u32, u64 or f32", as)};
+}
+
+float F32Value(const json& value, size_t index) {
+    if (value.is_number() && std::abs(value.get<double>()) <= (std::numeric_limits<float>::max)()) {
+        return static_cast<float>(value.get<double>());
+    }
+    const std::string text = value.is_string() ? value.get<std::string>() : std::string{};
+    if (text == "nan") {
+        return std::numeric_limits<float>::quiet_NaN();
+    }
+    if (text == "inf") {
+        return std::numeric_limits<float>::infinity();
+    }
+    if (text == "-inf") {
+        return -std::numeric_limits<float>::infinity();
+    }
+    throw std::runtime_error{fmt::format(
+        "data[{}] must be a number within f32's range, \"nan\", \"inf\" or \"-inf\"", index)};
 }
 
 /// The size of a read: 1 to MAX_READ bytes, not wrapping past the end of the address space.
@@ -158,6 +193,17 @@ Kernel::KProcess& Application(ToolState& state) {
 /// 16 bits, so addresses there would alias and are unmapped instead.
 const u8* GuestByte(Memory::Memory& memory, u64 address) {
     return (address >> 48) == 0 ? memory.GetPointerSilent(address) : nullptr;
+}
+
+std::optional<u64> FirstUnmapped(Memory::Memory& memory, u64 address, size_t size) {
+    for (size_t offset = 0; offset < size;) {
+        const u64 current = address + offset;
+        if (GuestByte(memory, current) == nullptr) {
+            return current;
+        }
+        offset += Memory::LICHII_PAGESIZE - (current & Memory::LICHII_PAGEMASK);
+    }
+    return std::nullopt;
 }
 
 bool IsVulkan() {
@@ -602,6 +648,18 @@ json ReadMemory(ToolState& state, const json& params) {
     return result;
 }
 
+json WriteMemory(ToolState& state, const json& params) {
+    const u64 address = AddressParam(params, "address");
+    const std::vector<u8> bytes =
+        ParseMemory(params.at("data"), params.value("as", std::string{"hex"}));
+    if (const auto unmapped = WriteGuestMemory(Application(state), address, bytes)) {
+        throw std::runtime_error{fmt::format(
+            "guest address {:#x} is not mapped (writing {} bytes at {:#x}); nothing was written",
+            *unmapped, bytes.size(), address)};
+    }
+    return {{"address", HexAddress(address)}, {"size", bytes.size()}};
+}
+
 json SearchMemory(ToolState& state, const json& params) {
     const std::vector<u8> pattern = ParseHexBytes(params.at("pattern").get<std::string>());
     if (pattern.size() > 256) {
@@ -789,6 +847,7 @@ Handlers MakeHandlers(const std::shared_ptr<ToolState>& state) {
         {"host_timing", handler(HostTiming)},
         {"render_follower", handler(RenderFollower)},
         {"read_memory", handler(ReadMemory)},
+        {"write_memory", handler(WriteMemory)},
         {"search_memory", handler(SearchMemory)},
         {"read_gpu_memory", handler(ReadGpuMemory)},
         {"input", waiting(Input)},
@@ -833,7 +892,7 @@ std::vector<u8> ParseHexBytes(std::string_view text) {
     }
     if (bytes.empty() || digits.size() % 2 != 0) {
         throw std::runtime_error{fmt::format(
-            "bad pattern \"{}\": want hex byte pairs in memory order (little endian: 1.0f is "
+            "bad hex \"{}\": want hex byte pairs in memory order (little endian: 1.0f is "
             "0000803f)",
             text)};
     }
@@ -841,6 +900,7 @@ std::vector<u8> ParseHexBytes(std::string_view text) {
 }
 
 json FormatMemory(std::span<const u8> bytes, std::string_view as) {
+    const size_t element = ElementSize(as);
     if (as == "hex") {
         std::string hex;
         hex.reserve(bytes.size() * 2);
@@ -848,10 +908,6 @@ json FormatMemory(std::span<const u8> bytes, std::string_view as) {
             fmt::format_to(std::back_inserter(hex), "{:02x}", byte);
         }
         return {{"hex", std::move(hex)}};
-    }
-    const size_t element = as == "u32" || as == "f32" ? 4 : as == "u64" ? 8 : 0;
-    if (element == 0) {
-        throw std::runtime_error{fmt::format("as \"{}\": want hex, u32, u64 or f32", as)};
     }
     if (bytes.size() % element != 0) {
         throw std::runtime_error{fmt::format("size must be a multiple of {} for {}", element, as)};
@@ -882,6 +938,40 @@ json FormatMemory(std::span<const u8> bytes, std::string_view as) {
     return {{std::string{as}, std::move(values)}};
 }
 
+std::vector<u8> ParseMemory(const json& data, std::string_view as) {
+    const size_t element = ElementSize(as);
+    if (as == "hex") {
+        if (!data.is_string()) {
+            throw std::runtime_error{"data must be a hex string for hex"};
+        }
+        return ParseHexBytes(data.get<std::string>());
+    }
+    if (!data.is_array() || data.empty()) {
+        throw std::runtime_error{fmt::format("data must be a non-empty array for {}", as)};
+    }
+    std::vector<u8> bytes(data.size() * element);
+    for (size_t index = 0; index < data.size(); ++index) {
+        const json& value = data[index];
+        u8* const target = bytes.data() + index * element;
+        if (as == "u64") {
+            const u64 word = HexNumber(value, fmt::format("data[{}]", index));
+            std::memcpy(target, &word, sizeof(word));
+        } else if (as == "u32") {
+            if (!value.is_number_unsigned() ||
+                value.get<u64>() > (std::numeric_limits<u32>::max)()) {
+                throw std::runtime_error{
+                    fmt::format("data[{}] must be a number from 0 to 2^32 - 1", index)};
+            }
+            const u32 word = value.get<u32>();
+            std::memcpy(target, &word, sizeof(word));
+        } else {
+            const float single = F32Value(value, index);
+            std::memcpy(target, &single, sizeof(single));
+        }
+    }
+    return bytes;
+}
+
 std::optional<u64> ReadGuestMemory(Memory::Memory& memory, u64 address, std::span<u8> out) {
     for (size_t offset = 0; offset < out.size();) {
         const u64 current = address + offset;
@@ -894,6 +984,22 @@ std::optional<u64> ReadGuestMemory(Memory::Memory& memory, u64 address, std::spa
         }
         std::memcpy(out.data() + offset, source, length);
         offset += length;
+    }
+    return std::nullopt;
+}
+
+std::optional<u64> WriteGuestMemory(Kernel::KProcess& process, u64 address,
+                                    std::span<const u8> bytes) {
+    Memory::Memory& memory = process.GetMemory();
+    if (const auto unmapped = FirstUnmapped(memory, address, bytes.size())) {
+        return unmapped;
+    }
+    const bool written = memory.WriteBlock(address, bytes.data(), bytes.size());
+    Core::InvalidateInstructionCacheRange(&process, address, bytes.size());
+    if (!written) {
+        throw std::runtime_error{fmt::format(
+            "the game unmapped part of {:#x}+{:#x} while it was written; the rest was written",
+            address, bytes.size())};
     }
     return std::nullopt;
 }

@@ -25,6 +25,10 @@ namespace Core::Memory {
 class Memory;
 }
 
+namespace Kernel {
+class KProcess;
+}
+
 namespace Core::Nx2Debug {
 
 class Server;
@@ -59,10 +63,22 @@ private:
 /// unknown or the size is not a multiple of its element.
 [[nodiscard]] nlohmann::json FormatMemory(std::span<const u8> bytes, std::string_view as);
 
+/// write_memory's data, in the form FormatMemory gives under the key as: a hex string, or a
+/// non-empty array of u32 numbers, u64 hex strings or numbers, or f32 numbers and "nan", "inf" or
+/// "-inf". Throws std::runtime_error when the format is unknown or data does not fit it.
+[[nodiscard]] std::vector<u8> ParseMemory(const nlohmann::json& data, std::string_view as);
+
 /// Copies guest memory from a thread that is not a guest CPU core (docs/nx2/debug-mcp.md, "Guest
 /// and GPU memory"). Returns the first address that is not mapped; out is then partly written.
 [[nodiscard]] std::optional<u64> ReadGuestMemory(Memory::Memory& memory, u64 address,
                                                  std::span<u8> out);
+
+/// Writes guest memory from a thread that is not a guest CPU core and drops the code the CPU
+/// translated from it (docs/nx2/debug-mcp.md, "Guest and GPU memory"). Returns the first address
+/// that is not mapped; nothing is written then. Throws std::runtime_error when the game unmaps a
+/// page during the write, after writing the rest.
+[[nodiscard]] std::optional<u64> WriteGuestMemory(Kernel::KProcess& process, u64 address,
+                                                  std::span<const u8> bytes);
 
 struct GuestSearch {
     std::vector<u64> hits;

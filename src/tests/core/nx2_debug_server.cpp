@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstring>
@@ -373,6 +374,59 @@ TEST_CASE("Debug memory formats as hex, words and floats", "[core][nx2_debug_ser
     REQUIRE_THROWS_AS(Core::Nx2Debug::FormatMemory(std::span{bytes}.first(12), "u64"),
                       std::runtime_error);
     REQUIRE_THROWS_AS(Core::Nx2Debug::FormatMemory(bytes, "f16"), std::runtime_error);
+}
+
+TEST_CASE("Debug memory writes back across pages what a read gives in each format",
+          "[core][nx2_debug_server]") {
+    GuestPages guest;
+    const std::array<float, 8> floats{1.0f,
+                                      -2.5f,
+                                      -0.0f,
+                                      std::numeric_limits<float>::infinity(),
+                                      -std::numeric_limits<float>::infinity(),
+                                      std::numeric_limits<float>::quiet_NaN(),
+                                      std::numeric_limits<float>::denorm_min(),
+                                      std::numeric_limits<float>::max()};
+    std::array<u8, 0x20> bytes{};
+    std::memcpy(bytes.data(), floats.data(), bytes.size());
+    for (const char* as : {"hex", "u32", "u64", "f32"}) {
+        CAPTURE(as);
+        std::memset(guest.backing, 0, 0x4000);
+        const json read = json::parse(Core::Nx2Debug::FormatMemory(bytes, as).dump());
+        REQUIRE_FALSE(Core::Nx2Debug::WriteGuestMemory(guest.process, 0x4ff0,
+                                                       Core::Nx2Debug::ParseMemory(read[as], as)));
+        std::array<u8, 0x20> back{};
+        REQUIRE_FALSE(Core::Nx2Debug::ReadGuestMemory(guest.process.GetMemory(), 0x4ff0, back));
+        REQUIRE(back == bytes);
+    }
+}
+
+TEST_CASE("Debug memory writes nothing when a page of the range is not mapped",
+          "[core][nx2_debug_server]") {
+    GuestPages guest;
+    std::array<u8, 0x20> bytes{};
+    bytes.fill(0xab);
+    REQUIRE(Core::Nx2Debug::WriteGuestMemory(guest.process, 0x5ff0, bytes) == u64{0x6000});
+    REQUIRE(Core::Nx2Debug::WriteGuestMemory(guest.process, 0x6800, bytes) == u64{0x6800});
+    REQUIRE(Core::Nx2Debug::WriteGuestMemory(guest.process, (1ULL << 48) | 0x4000, bytes) ==
+            ((1ULL << 48) | 0x4000));
+    REQUIRE(std::all_of(guest.backing, guest.backing + 0x4000, [](u8 byte) { return byte == 0; }));
+}
+
+TEST_CASE("Debug memory write data that does not fit its format is refused",
+          "[core][nx2_debug_server]") {
+    for (const auto& [data, as] : std::initializer_list<std::pair<json, const char*>>{
+             {json::array({"00"}), "hex"},
+             {json::array({}), "u32"},
+             {json::array({0x1'0000'0000ULL}), "u32"},
+             {json::array({-1}), "u32"},
+             {json::array({1.5}), "u32"},
+             {json::array({"0x1g"}), "u64"},
+             {json::array({1e39}), "f32"},
+             {json{{"f32", {1.0}}}, "f32"}}) {
+        CAPTURE(data.dump(), as);
+        REQUIRE_THROWS_AS(Core::Nx2Debug::ParseMemory(data, as), std::runtime_error);
+    }
 }
 
 TEST_CASE("Debug control hands GPU reads to the rasterizer once", "[core][nx2_debug_server]") {

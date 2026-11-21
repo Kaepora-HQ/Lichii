@@ -186,6 +186,26 @@ TOOLS = [
         },
     },
     {
+        "name": "write_memory",
+        "description": "Writes the game's guest virtual memory while it runs, as the GDB stub "
+                       "does, and drops the code the CPU translated from it. 'data' takes what "
+                       "read_memory returns for the same 'as': a hex string for hex (default), "
+                       "an array of numbers for u32, of hex strings for u64, and of numbers, "
+                       "'nan', 'inf' or '-inf' for f32. f32 is not exact for a NaN: every NaN "
+                       "reads as 'nan' and is written as the quiet one, so send bytes back "
+                       "unchanged as hex. An unmapped page fails with the first unmapped address "
+                       "and writes nothing.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "address": {"type": ["string", "integer"]},
+                "data": {"type": ["string", "array"], "items": {"type": ["string", "number"]}},
+                "as": {"type": "string", "enum": ["hex", "u32", "u64", "f32"]},
+            },
+            "required": ["address", "data"],
+        },
+    },
+    {
         "name": "search_memory",
         "description": "Finds a byte pattern (hex pairs in memory order: little endian, so 1.0f "
                        "is '0000803f') in the mapped guest memory of the heap region (default) or "
