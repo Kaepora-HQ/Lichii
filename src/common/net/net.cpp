@@ -89,7 +89,8 @@ std::vector<Asset> Release::GetPlatformAssets(std::string_view platform,
     }
 
     std::vector<std::string_view> extensions;
-    if (platform == "linux-x86_64" || platform == "linux-aarch64") {
+    if (platform == "linux-x86_64" || platform == "linux-aarch64" ||
+        platform.starts_with("linux-x86_64-zen")) {
         if (package != LinuxPackage::Archive) {
             extensions.push_back(".AppImage");
         }

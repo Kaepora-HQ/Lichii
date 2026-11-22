@@ -277,7 +277,7 @@ WhatsNewDialog::WhatsNewDialog(quint32 build, QDate build_date, bool include_pen
                                                                      : Qt::LeftToRight);
     connect(archive, &QToolButton::clicked, this, [] {
         QDesktopServices::openUrl(
-            QUrl(QStringLiteral("https://github.com/zortos293/Lichii/releases")));
+            QUrl(QStringLiteral("https://github.com/Kaepora-HQ/Lichii/releases")));
     });
     history->addWidget(archive, 0, 1, Qt::AlignHCenter);
 
