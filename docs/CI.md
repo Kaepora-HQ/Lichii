@@ -108,6 +108,23 @@ To retrain:
 3. Merge with that LLVM: `llvm-profdata merge -o lichii-windows.profdata <dir>/*.profraw`.
 4. Check that `llvm-profdata show --all-functions lichii-windows.profdata` lists names starting with `?`, then replace the file in the repository root.
 
+## Linux PGO profile
+
+The x86-64 Linux PGO packages (`linux-x86_64-pgo` and its Zen 4 and Zen 5 variants) are compiled by clang `PGO_LLVM_VERSION` with `-fprofile-use=lichii-linux.profdata`. That profile is `eglantine.profdata` merged with a profile of Ocarina of Time played on x86-64 Linux. Ours is weighted to twice `eglantine.profdata`'s total count, the share Ocarina has in upstream's pull request #1909, so the code Eglantine's profile covered keeps some weight. `linux-aarch64-pgo` keeps `eglantine.profdata`.
+
+The session behind it is about 66,700 frames of play in two rounds of nine starts. Each start goes to one place: a new game's opening, Link's house with a save from the menu, Kokiri Forest, Hyrule Field, Castle Town, the Bazaar's keeper, the Deku Tree's first room and its chest, Dodongo's Cavern, and Zora's Domain. Each start begins with the title's pipeline cache empty. A start recompiles every pipeline in that cache, at boot or in the background, and with a full cache the shader compiler took half the counts, though it takes almost none of play.
+
+A static function's name in a profile begins with the absolute path of its source file. The release compiles under `/home/runner/work/Lichii/Lichii`, so a profile trained in another folder matches none of its static functions until those paths are rewritten.
+
+As for Windows, an older profile only produces warnings. A function that changed after the training loses its counts and is compiled as in the plain build. A function the training built and never ran is marked cold: it is optimized for size and placed away from the hot code.
+
+To retrain:
+
+1. Configure as the `linux-x86_64-pgo` job does, with `-fprofile-generate=<dir> -fprofile-update=atomic -mllvm -runtime-counter-relocation` in place of `-fprofile-use`, and with `-DENABLE_WERROR=OFF`, so that a warning only this build's compiler or libraries raise does not stop it. Build `lichii`. Without the system's OpenSSL, configure builds OpenSSL with plain `clang`, so set `CC` and `CXX` to the same clang.
+2. Run it with `LLVM_PROFILE_FILE=<dir>/lichii-%p.profraw`, play, and exit normally. Counters are written only at exit.
+3. Merge with the same LLVM: `llvm-profdata merge -o ocarina.profdata <dir>/*.profraw`. Then write it as text (`llvm-profdata merge --text`), replace the training build's source folder with `/home/runner/work/Lichii/Lichii` and its build folder with `/home/runner/work/Lichii/Lichii/build/release`, and merge it back.
+4. Merge with `eglantine.profdata`, choosing `-weighted-input=` weights that make ours about twice its total count (`llvm-profdata show` prints each total). Replace `lichii-linux.profdata` in the repository root.
+
 ## Release naming
 
 | Kind              | Tag                    | Release title                            | GitHub Release flag                |
