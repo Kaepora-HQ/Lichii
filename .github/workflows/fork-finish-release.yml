@@ -1,0 +1,73 @@
+name: fork-finish-release
+
+# GitHub starts this after a release-binaries run that a person, a push or the schedule started, and not after one
+# that a workflow started with its own token.
+on:
+  workflow_run:
+    workflows: [release-binaries]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: The id of the release-binaries run to finish
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  finish:
+    name: Mark or remove the release
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Mark or remove the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id || inputs.run_id }}
+        run: |
+          set -euo pipefail
+          run=$(gh api "repos/$GH_REPO/actions/runs/$RUN_ID")
+          field() { jq -r ".$1" <<< "$run"; }
+          if [ "$(field path)" != .github/workflows/release-binaries.yml ] || [ "$(field status)" != completed ]; then
+            echo "::error::Run $RUN_ID is not a release-binaries run that has ended"
+            exit 1
+          fi
+          tag=build-$(field run_number)
+          sha=$(field head_sha)
+          tagged=$(gh api "repos/$GH_REPO/git/matching-refs/tags/$tag" \
+            --jq ".[] | select(.ref == \"refs/tags/$tag\") | .object.sha")
+          if [ "$tagged" != "$sha" ]; then
+            echo "Run $RUN_ID published nothing: no tag $tag names $sha."
+            exit 0
+          fi
+
+          # The update check offers prereleases too, so the release of a run that failed must not stay.
+          if [ "$(field conclusion)" != success ]; then
+            if gh release view "$tag" > /dev/null 2>&1; then
+              gh release delete "$tag" --cleanup-tag --yes
+            else
+              gh api -X DELETE "repos/$GH_REPO/git/refs/tags/$tag"
+            fi
+            echo "Run $RUN_ID ended with $(field conclusion): its release and tag $tag are removed."
+            exit 0
+          fi
+          if [ "$sha" != "$(gh api "repos/$GH_REPO/branches/nx2" --jq .commit.sha)" ]; then
+            echo "$sha is no longer the head of nx2, so $tag stays a prerelease."
+            exit 0
+          fi
+          based=$(gh api "repos/$GH_REPO/commits?sha=$sha&per_page=100" \
+            --jq '[.[].commit.message | split("\n")[] | select(startswith("Based on "))][0] // ""')
+          if [ -z "$based" ]; then
+            echo "::error::No commit among the last 100 on nx2 says which upstream build it is based on"
+            exit 1
+          fi
+          notes=$(gh release view "$tag" --json body --jq .body)
+          if ! grep -qxF "$based" <<< "$notes"; then
+            notes=$(printf '%s\n\n%s' "$based" "$notes")
+          fi
+          gh release edit "$tag" --notes-file - --prerelease=false --latest <<< "$notes"
+          echo "$tag is the latest release. $based"
