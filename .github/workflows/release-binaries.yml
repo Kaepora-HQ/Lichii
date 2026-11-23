@@ -134,11 +134,13 @@ jobs:
             pgo: true
             profile: lichii-linux.profdata
             march: znver4
+            thinlto: true
           - platform: linux-x86_64-zen5-pgo
             runner: ubuntu-24.04
             pgo: true
             profile: lichii-linux.profdata
             march: znver5
+            thinlto: true
           - platform: windows-x86_64
             runner: windows-2022
           - platform: windows-x86_64-pgo
@@ -407,6 +409,13 @@ jobs:
             profile="-fprofile-use=$PWD/${{ matrix.profile || 'eglantine.profdata' }} -Wno-backend-plugin \
               -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date"
             profile+="${{ matrix.march && format(' -march={0} -mtune={0}', matrix.march) || '' }}"
+            if [ '${{ matrix.thinlto }}' = true ]; then
+              # CMake archives ThinLTO's bitcode with llvm-ar. lld keeps each module's code in .lto-cache,
+              # which the compiler cache saves, so a link only recompiles the modules that changed.
+              sudo apt-get install -y --no-install-recommends "llvm-$PGO_LLVM_VERSION"
+              flags+=(-DENABLE_LTO=ON "-DCMAKE_EXE_LINKER_FLAGS_RELEASE=-Wl,--thinlto-jobs=all \
+                -Wl,--thinlto-cache-dir=$PWD/.lto-cache -Wl,--thinlto-cache-policy=cache_size_bytes=1500m")
+            fi
             flags+=(
               "-DCMAKE_C_COMPILER=clang-$PGO_LLVM_VERSION"
               "-DCMAKE_CXX_COMPILER=clang++-$PGO_LLVM_VERSION"
@@ -875,8 +884,8 @@ jobs:
 
           $({
             row amd64 "$(appimage_tar lichii-linux-x86_64)" "$(appimage_tar lichii-linux-x86_64-pgo)" "Make the AppImage executable (\`chmod +x\`) and run it"
-            row "amd64, AMD Zen 4 or Zen 5" "" "$(appimage_tar lichii-linux-x86_64-zen4-pgo)" "Only for an AMD processor of the Zen 4 or Zen 5 architecture. The series number does not tell it: some Ryzen 7000 laptop processors are Zen 2 or Zen 3. AMD's page for your processor names its architecture."
-            row "amd64, AMD Zen 5" "" "$(appimage_tar lichii-linux-x86_64-zen5-pgo)" "Only for an AMD processor of the Zen 5 architecture: it does not run on Zen 4. The series number does not tell it. AMD's page for your processor names its architecture."
+            row "amd64, AMD Zen 4 or Zen 5" "" "$(appimage_tar lichii-linux-x86_64-zen4-pgo)" "Built with ThinLTO. Only for an AMD processor of the Zen 4 or Zen 5 architecture. The series number does not tell it: some Ryzen 7000 laptop processors are Zen 2 or Zen 3. AMD's page for your processor names its architecture."
+            row "amd64, AMD Zen 5" "" "$(appimage_tar lichii-linux-x86_64-zen5-pgo)" "Built with ThinLTO. Only for an AMD processor of the Zen 5 architecture: it does not run on Zen 4. The series number does not tell it. AMD's page for your processor names its architecture."
             row "ARM (aarch64)" "$(appimage_tar lichii-linux-aarch64)" "$(appimage_tar lichii-linux-aarch64-pgo)" ""
           } | table)
 
